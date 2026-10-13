@@ -1,0 +1,243 @@
+import json, os, sys, time
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+
+SYMBOLS = {
+    "XAUUSD": ("GC=F", False),
+    "XAGUSD": ("SI=F", False),
+    "EURUSD": ("EURUSD=X", False),
+    "GBPUSD": ("GBPUSD=X", False),
+    "US500":  ("^GSPC", False),
+    "NAS100": ("^NDX", False),
+    "US30":   ("^DJI", False),
+    "BTCUSD": ("BTC-USD", True),
+    "ETHUSD": ("ETH-USD", True),
+}
+TIMEFRAMES = {"M15": ("15m", "30d", 15), "H1": ("1h", "60d", 60)}
+
+P = dict(
+    e1=5, e2=10, e3=15,
+    sweepLen=20, waitBars=5, rangeLen=60, pivLen=3,
+    minScore=60, minGap=10, bodyPct=50.0,
+    rr1=1.0, rr2=2.0, slBuf=0.2, ote=0.618,
+)
+LOOKBACK = 3
+STATE_FILE = "state.json"
+
+
+def fetch(ticker, tf):
+    interval, period, mins = TIMEFRAMES[tf]
+    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+    if df is None or df.empty:
+        return None
+    df = df.rename(columns=str.lower)[["open", "high", "low", "close"]].dropna()
+    df.index = df.index.tz_convert("UTC") if df.index.tz else df.index.tz_localize("UTC")
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=mins)
+    return df[df.index <= cutoff]
+
+
+def atr(df, n=14):
+    pc = df["close"].shift(1)
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def recent(flag, bars):
+    return flag.rolling(bars + 1, min_periods=1).max().fillna(0).astype(bool).values
+
+
+def analyze(df, crypto):
+    n = len(df)
+    if n < 100:
+        return []
+    o, h, l, c = (df[k].values for k in ("open", "high", "low", "close"))
+    a = atr(df).values
+
+    ema1 = df["close"].ewm(span=P["e1"], adjust=False).mean().values
+    ema2 = df["close"].ewm(span=P["e2"], adjust=False).mean().values
+    ema3 = df["close"].ewm(span=P["e3"], adjust=False).mean().values
+    bullEma = (ema1 > ema2) & (ema2 > ema3)
+    bearEma = (ema1 < ema2) & (ema2 < ema3)
+
+    ny = df.index.tz_convert("America/New_York")
+    mins = ny.hour * 60 + ny.minute
+    inKZ = ((mins >= 120) & (mins < 300)) | ((mins >= 420) & (mins < 600))
+    if crypto:
+        inKZ = np.zeros(n, bool)
+
+    priorLow = df["low"].rolling(P["sweepLen"]).min().shift(1)
+    priorHigh = df["high"].rolling(P["sweepLen"]).max().shift(1)
+    sweepLow = (df["low"] < priorLow) & (df["close"] > priorLow)
+    sweepHigh = (df["high"] > priorHigh) & (df["close"] < priorHigh)
+    recSweepLow = recent(sweepLow, P["waitBars"])
+    recSweepHigh = recent(sweepHigh, P["waitBars"])
+
+    L = P["pivLen"]
+    ph = np.full(n, np.nan)
+    pl = np.full(n, np.nan)
+    for i in range(L, n - L):
+        if h[i] >= h[i - L:i + L + 1].max():
+            ph[i + L] = h[i]
+        if l[i] <= l[i - L:i + L + 1].min():
+            pl[i + L] = l[i]
+
+    bullBreak = np.zeros(n, bool)
+    bearBreak = np.zeros(n, bool)
+    kind = [""] * n
+    phLvl = plLvl = prevPh = prevPl = np.nan
+    trend = 0
+    for i in range(n):
+        if not np.isnan(ph[i]):
+            phLvl = ph[i]
+        if not np.isnan(pl[i]):
+            plLvl = pl[i]
+        if i > 0 and not np.isnan(phLvl) and not np.isnan(prevPh):
+            bullBreak[i] = c[i] > phLvl and c[i - 1] <= prevPh
+        if i > 0 and not np.isnan(plLvl) and not np.isnan(prevPl):
+            bearBreak[i] = c[i] < plLvl and c[i - 1] >= prevPl
+        if bullBreak[i]:
+            kind[i] = "CHoCH" if trend == -1 else "BOS"
+            trend = 1
+        elif bearBreak[i]:
+            kind[i] = "CHoCH" if trend == 1 else "BOS"
+            trend = -1
+        prevPh, prevPl = phLvl, plLvl
+
+    rHi = df["high"].rolling(P["rangeLen"]).max().values
+    rLo = df["low"].rolling(P["rangeLen"]).min().values
+    eq = (rHi + rLo) / 2
+    discount = c < eq
+    premium = c > eq
+
+    bullFVG = pd.Series((l > np.roll(h, 2)) & ((l - np.roll(h, 2)) > a * 0.3), index=df.index)
+    bearFVG = pd.Series((h < np.roll(l, 2)) & ((np.roll(l, 2) - h) > a * 0.3), index=df.index)
+    bullFVG.iloc[:2] = False
+    bearFVG.iloc[:2] = False
+    fvgBuy = recent(bullFVG, P["waitBars"] + 3)
+    fvgSell = recent(bearFVG, P["waitBars"] + 3)
+
+    rng = h - l
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bodyOk = (rng > 0) & (np.abs(c - o) / rng * 100 >= P["bodyPct"])
+    candleBull = (c > o) & bodyOk
+    candleBear = (c < o) & bodyOk
+
+    buyScore = (bullBreak * 20 + recSweepLow * 25 + bullEma * 15 + discount * 10
+                + inKZ * 10 + fvgBuy * 10 + candleBull * 10).astype(float)
+    sellScore = (bearBreak * 20 + recSweepHigh * 25 + bearEma * 15 + premium * 10
+                 + inKZ * 10 + fvgSell * 10 + candleBear * 10).astype(float)
+    if crypto:
+        buyScore *= 100 / 90
+        sellScore *= 100 / 90
+
+    signals = []
+    lastSig = -100000
+    w = P["waitBars"] + 5
+    for i in range(w, n):
+        buy = bullBreak[i] and buyScore[i] >= P["minScore"]
+        sell = bearBreak[i] and sellScore[i] >= P["minScore"]
+        if not (buy or sell) or i - lastSig < P["minGap"]:
+            continue
+        lastSig = i
+        lo = l[i - w + 1:i + 1]
+        hi = h[i - w + 1:i + 1]
+        legLo, legHi = lo.min(), hi.max()
+        if buy:
+            off = int(np.argmin(lo[::-1]))
+            entry = legHi - P["ote"] * (legHi - legLo)
+            sl = min(l[i - off], legLo) - a[i] * P["slBuf"]
+            risk = entry - sl
+            side, score = "BUY", buyScore[i]
+            tp1, tp2 = entry + risk * P["rr1"], entry + risk * P["rr2"]
+        else:
+            off = int(np.argmax(hi[::-1]))
+            entry = legLo + P["ote"] * (legHi - legLo)
+            sl = max(h[i - off], legHi) + a[i] * P["slBuf"]
+            risk = sl - entry
+            side, score = "SELL", sellScore[i]
+            tp1, tp2 = entry - risk * P["rr1"], entry - risk * P["rr2"]
+        if risk <= 0:
+            continue
+        signals.append(dict(i=i, time=df.index[i], side=side, score=int(round(score)),
+                            kind=kind[i], entry=entry, sl=sl, tp1=tp1, tp2=tp2))
+    return signals
+
+
+def fmt(x):
+    return f"{x:.{5 if x < 10 else 3 if x < 100 else 2}f}"
+
+
+def build_message(name, tf, s, bar_mins):
+    icon = "🟢" if s["side"] == "BUY" else "🔴"
+    t = (s["time"] + pd.Timedelta(minutes=bar_mins)).tz_convert("America/New_York")
+    return (f"{icon} {s['side']} {name} {tf} | Score {s['score']} ({s['kind']})\n"
+            f"Entry (limit): {fmt(s['entry'])}\n"
+            f"SL: {fmt(s['sl'])}\n"
+            f"TP1: {fmt(s['tp1'])} | TP2: {fmt(s['tp2'])}\n"
+            f"Candle close: {t:%Y-%m-%d %H:%M} NY\n"
+            f"Check the chart first. Manual trade only.")
+
+
+def send(text):
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        print("Missing TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+        return False
+    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat, "text": text}, timeout=20)
+    if not r.ok:
+        print("Telegram error:", r.status_code, r.text)
+    return r.ok
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def main():
+    if "--test" in sys.argv:
+        print("sent" if send("✅ ICT bot connected. Signals will appear here.") else "failed")
+        return
+    dry = "--dry" in sys.argv
+    state = load_state()
+    now = time.time()
+    state = {k: v for k, v in state.items() if now - v < 3 * 86400}
+
+    for name, (ticker, crypto) in SYMBOLS.items():
+        for tf, (_, _, bar_mins) in TIMEFRAMES.items():
+            try:
+                df = fetch(ticker, tf)
+                if df is None:
+                    print(f"{name} {tf}: no data")
+                    continue
+                sigs = analyze(df, crypto)
+                n = len(df)
+                for s in sigs:
+                    if dry:
+                        print(build_message(name, tf, s, bar_mins), "\n")
+                        continue
+                    if s["i"] < n - LOOKBACK:
+                        continue
+                    key = f"{name}|{tf}|{s['time'].isoformat()}|{s['side']}"
+                    if key in state:
+                        continue
+                    if send(build_message(name, tf, s, bar_mins)):
+                        state[key] = now
+                print(f"{name} {tf}: ok ({n} bars)")
+            except Exception as e:
+                print(f"{name} {tf}: error {e}")
+
+    if not dry:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+
+
+if __name__ == "__main__":
+    main()
